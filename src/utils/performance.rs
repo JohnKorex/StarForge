@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractMetrics {
@@ -84,7 +84,7 @@ pub struct GasUsageRecord {
 }
 
 thread_local! {
-    static TEST_METRICS_DIR: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    static TEST_METRICS_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 fn metrics_dir() -> Result<PathBuf> {
@@ -400,7 +400,7 @@ pub fn analyze_bottlenecks(contract_id: &str) -> Result<BottleneckAnalysis> {
         }
     }
 
-    let total_gas: u64 = gas_history.iter().map(|r| r.gas_used).sum();
+    let _total_gas: u64 = gas_history.iter().map(|r| r.gas_used).sum();
     let total_executions = gas_history.len() as f64;
 
     let mut bottleneck_operations: Vec<String> = operation_frequencies
@@ -877,8 +877,7 @@ mod tests {
             network: "testnet".to_string(),
         };
 
-        let mut records: Vec<GasUsageRecord> = Vec::new();
-        records.push(record.clone());
+        let records: Vec<GasUsageRecord> = vec![record.clone()];
         fs::write(&file, serde_json::to_string_pretty(&records).unwrap()).unwrap();
 
         let loaded: Vec<GasUsageRecord> =
@@ -922,7 +921,6 @@ mod tests {
         let orig_userprofile = std::env::var("USERPROFILE").ok();
 
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
         std::env::set_var("USERPROFILE", tmp.path());
         TEST_METRICS_DIR.with(|d| *d.borrow_mut() = Some(tmp.path().to_path_buf()));
 
@@ -930,7 +928,6 @@ mod tests {
 
         TEST_METRICS_DIR.with(|d| *d.borrow_mut() = None);
         if let Some(h) = orig_home {
-            std::env::set_var("HOME", h);
         } else {
             std::env::remove_var("HOME");
         }
@@ -1135,11 +1132,11 @@ mod tests {
                 let record = GasUsageRecord {
                     contract_id: contract_id.clone(),
                     operation: "test_op".to_string(),
-                    gas_used: 10000 + i as u64 * 1000,
+                    gas_used: 10000 + i * 1000,
                     timestamp: (base_time - chrono::Duration::seconds((8 - i) as i64)).to_rfc3339(),
                     success: true,
                     execution_time_ms: 500 + i * 50,
-                    memory_used: Some(1_000_000 + i as u64 * 200_000),
+                    memory_used: Some(1_000_000 + i * 200_000),
                     network: "testnet".to_string(),
                 };
                 record_gas_usage(&record).unwrap();

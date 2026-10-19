@@ -19,6 +19,8 @@ fn test_exit_code_numeric_values() {
     assert_eq!(ExitCode::Signing.code(), 5);
     assert_eq!(ExitCode::Execution.code(), 6);
     assert_eq!(ExitCode::Environment.code(), 7);
+    assert_eq!(ExitCode::BreakingChange.code(), 8);
+    assert_eq!(ExitCode::SmokeTestFailure.code(), 9);
 }
 
 #[test]
@@ -30,6 +32,7 @@ fn test_exit_code_names_and_descriptions() {
     assert_eq!(ExitCode::Signing.name(), "SIGNING_ERROR");
     assert_eq!(ExitCode::Execution.name(), "EXECUTION_ERROR");
     assert_eq!(ExitCode::Environment.name(), "ENVIRONMENT_ERROR");
+    assert_eq!(ExitCode::BreakingChange.name(), "BREAKING_INTERFACE_CHANGE");
 
     assert!(!ExitCode::Usage.description().is_empty());
     assert!(!ExitCode::Config.description().is_empty());
@@ -37,6 +40,7 @@ fn test_exit_code_names_and_descriptions() {
     assert!(!ExitCode::Signing.description().is_empty());
     assert!(!ExitCode::Execution.description().is_empty());
     assert!(!ExitCode::Environment.description().is_empty());
+    assert!(!ExitCode::BreakingChange.description().is_empty());
 }
 
 // ── 2. Error classification tests (determine_exit_code) ───────────────────────
@@ -120,6 +124,39 @@ fn test_classify_environment_errors() {
 fn test_classify_general_failure_fallback() {
     let err = anyhow!("An unexpected internal computation state occurred");
     assert_eq!(determine_exit_code(&err), ExitCode::GeneralFailure);
+}
+
+#[test]
+fn test_classify_breaking_interface_change() {
+    let err = anyhow!(
+        "Breaking interface change detected: old wasm exposes a public interface \
+         that the new wasm no longer guarantees."
+    );
+    assert_eq!(determine_exit_code(&err), ExitCode::BreakingChange);
+}
+
+#[test]
+fn test_classify_smoke_test_failure_distinct_from_deploy_failure() {
+    use starforge::utils::smoke_tests::SmokeTestFailure;
+
+    let smoke: anyhow::Error = SmokeTestFailure {
+        failed: 1,
+        total: 2,
+        contract_id: format!("C{}", "A".repeat(55)),
+        network: "testnet".to_string(),
+    }
+    .into();
+    // The message mentions a contract and a network, but the type wins.
+    assert_eq!(determine_exit_code(&smoke), ExitCode::SmokeTestFailure);
+    assert_eq!(ExitCode::SmokeTestFailure.name(), "SMOKE_TEST_FAILURE");
+
+    // Still classified when wrapped in extra context.
+    let wrapped = smoke.context("deploy post-checks");
+    assert_eq!(determine_exit_code(&wrapped), ExitCode::SmokeTestFailure);
+
+    // A real deploy failure keeps its existing classification.
+    let deploy = anyhow!("Stellar CLI deployment failed: tx failed");
+    assert_eq!(determine_exit_code(&deploy), ExitCode::Execution);
 }
 
 // ── 3. Chained error context classification ───────────────────────────────────

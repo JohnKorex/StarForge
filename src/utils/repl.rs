@@ -5,7 +5,6 @@ use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
-use rustyline::history::History;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 use std::collections::HashSet;
@@ -446,6 +445,10 @@ impl StarForgeHelper {
 impl Helper for StarForgeHelper {}
 impl Hinter for StarForgeHelper {
     type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+        None
+    }
 }
 
 impl Highlighter for StarForgeHelper {
