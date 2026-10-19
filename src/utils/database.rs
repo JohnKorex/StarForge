@@ -3,14 +3,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 pub fn db_path() -> PathBuf {
     crate::utils::config::config_dir().join("starforge.db")
 }
 
 /// Current schema version of the database
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 /// Migration trait for defining schema changes
 pub trait Migration: Send + Sync {
@@ -21,6 +20,9 @@ pub trait Migration: Send + Sync {
     fn description(&self) -> &str;
 
     /// Apply the migration (upgrade)
+    ///
+    /// Takes a shared reference so a migration can run inside a
+    /// `rusqlite::Transaction`, which only derefs to `&Connection`.
     fn up(&self, conn: &Connection) -> Result<()>;
 
     /// Rollback the migration (downgrade)
@@ -44,49 +46,37 @@ pub struct MigrationResult {
     pub migrations_rolled_back: Vec<i64>,
 }
 
-use std::fmt;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Error types for migration operations
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MigrationError {
+    #[error("Migration version {0} is already applied")]
     AlreadyApplied(i64),
+
+    #[error("Migration version {0} not found")]
     NotFound(i64),
+
+    #[error("Cannot rollback: no migrations applied")]
     NothingToRollback,
+
+    #[error("Migration version {0} depends on unapplied version {1}")]
     MissingDependency(i64, i64),
+
+    #[error("Invalid migration sequence: versions must be consecutive")]
     InvalidSequence,
+
+    #[error("Database schema version {0} is not supported (minimum: {1}, maximum: {2})")]
     UnsupportedVersion(i64, i64, i64),
+
+    #[error("Migration failed: {0}")]
     MigrationFailed(String),
-}
 
-impl fmt::Display for MigrationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AlreadyApplied(v) => write!(f, "Migration version {v} is already applied"),
-            Self::NotFound(v) => write!(f, "Migration version {v} not found"),
-            Self::NothingToRollback => write!(f, "Cannot rollback: no migrations applied"),
-            Self::MissingDependency(v, dep) => {
-                write!(
-                    f,
-                    "Migration version {v} depends on unapplied version {dep}"
-                )
-            }
-            Self::InvalidSequence => {
-                write!(
-                    f,
-                    "Invalid migration sequence: versions must be consecutive"
-                )
-            }
-            Self::UnsupportedVersion(v, min, max) => {
-                write!(
-                    f,
-                    "Database schema version {v} is not supported (minimum: {min}, maximum: {max})"
-                )
-            }
-            Self::MigrationFailed(msg) => write!(f, "Migration failed: {msg}"),
-        }
-    }
+    #[error(
+        "Database at {path} is corrupted: {issues}. Restore from a backup with \
+         `starforge config db restore <backup-file>`, or move the corrupted file \
+         aside to start a fresh database."
+    )]
+    DatabaseCorrupted { path: String, issues: String },
 }
-
-impl std::error::Error for MigrationError {}
 
 pub struct Database {
     pub(crate) conn: Connection,
@@ -95,13 +85,54 @@ pub struct Database {
 impl Database {
     pub fn open() -> Result<Self> {
         let path = db_path();
+        // A pre-existing file is the only case corruption is possible (a
+        // brand-new file SQLite is about to create is trivially intact), so
+        // this check has to happen before `Connection::open`, which creates
+        // an empty file as a side effect and would make every open "existing"
+        // from then on.
+        let existed_before_open = path.exists();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(&path)
             .with_context(|| format!("Failed to open database at {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        Ok(Self { conn })
+        let db = Self { conn };
+        if existed_before_open {
+            db.fail_clearly_if_corrupted(&path)?;
+        }
+        Ok(db)
+    }
+
+    /// Run `PRAGMA integrity_check`/`PRAGMA foreign_key_check` and fail with a
+    /// [`MigrationError::DatabaseCorrupted`] (rather than surfacing corruption
+    /// later as a confusing query-time SQLite error) when either reports a
+    /// problem. Called from `open()` for a pre-existing database file; a
+    /// caller that already has a `Database` and wants to re-check later can
+    /// call `integrity_check()` directly.
+    fn fail_clearly_if_corrupted(&self, path: &std::path::Path) -> Result<()> {
+        // A file that is not a SQLite database at all (or too badly damaged
+        // to read its header) fails the `PRAGMA` query itself rather than
+        // returning a row describing the problem; that case is corruption
+        // too; it just surfaces through a different Result arm.
+        let issues = match self.integrity_check() {
+            Ok(issues) => issues,
+            Err(e) => {
+                return Err(MigrationError::DatabaseCorrupted {
+                    path: path.display().to_string(),
+                    issues: e.to_string(),
+                }
+                .into());
+            }
+        };
+        if issues.is_empty() || issues == ["ok".to_string()] {
+            return Ok(());
+        }
+        Err(MigrationError::DatabaseCorrupted {
+            path: path.display().to_string(),
+            issues: issues.join("; "),
+        }
+        .into())
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -131,17 +162,73 @@ impl Database {
     }
 
     pub fn initialize(&self) -> Result<()> {
+        self.initialize_impl()
+    }
+
+    /// Same as [`Self::initialize`], but when an upgrade is actually about to
+    /// run (an existing database whose schema version trails
+    /// [`CURRENT_SCHEMA_VERSION`]), first copies the database file into
+    /// `backup_dir` and returns the backup's path. A fresh database and an
+    /// already-current one have nothing to protect against, so no backup is
+    /// made and `Ok(None)` is returned — the same case `run_migrations`
+    /// treats as a no-op.
+    ///
+    /// The backup itself uses [`Self::backup`], a plain file copy; on a
+    /// WAL-mode database (`open()` always sets `journal_mode=WAL`) this reads
+    /// the main database file only, which SQLite's WAL protocol guarantees is
+    /// self-consistent even mid-write, so no separate quiescing step is
+    /// needed before copying it.
+    pub fn initialize_with_backup(&self, backup_dir: &std::path::Path) -> Result<Option<PathBuf>> {
+        // A backup is only worth taking for a database that was already
+        // initialized (has a `schema_version` row) and is genuinely behind.
+        // A brand-new database (no `meta` table yet, or a `meta` table with
+        // no row for this key) has no prior data to protect, so it takes the
+        // same `Ok(None)` path `initialize()`'s own fresh-database branch
+        // does — `get_meta` erroring with "no such table" is treated
+        // identically to it returning `Ok(None)`, mirroring
+        // `get_current_schema_version`'s own handling of the same case.
+        let needs_upgrade = match self.get_meta("schema_version") {
+            Ok(Some(v)) => v.parse::<i64>().unwrap_or(0) < CURRENT_SCHEMA_VERSION,
+            Ok(None) => false,
+            Err(e) if e.to_string().contains("no such table: meta") => false,
+            Err(e) => return Err(e),
+        };
+
+        let backup_path = if needs_upgrade {
+            std::fs::create_dir_all(backup_dir)?;
+            let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+            let dest = backup_dir.join(format!("starforge-pre-migrate-{timestamp}.db"));
+            self.backup(&dest)
+                .with_context(|| format!("Failed to back up database to {}", dest.display()))?;
+            Some(dest)
+        } else {
+            None
+        };
+
+        self.initialize_impl()?;
+        Ok(backup_path)
+    }
+
+    fn initialize_impl(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA)?;
         self.ensure_column("wallets", "secret_key", "TEXT")?;
         self.ensure_column("wallets", "rotation_history", "TEXT NOT NULL DEFAULT '[]'")?;
+        // #902: extra root CAs per network; NULL for every pre-existing row.
+        self.ensure_column("networks", "ca_bundle", "TEXT")?;
 
-        // Run migrations if this is not a fresh database
+        // Run migrations if this is not a fresh database.
+        //
+        // `get_meta` returns `Ok(None)` for a key that is absent, so the
+        // presence of the row — not the success of the lookup — decides which
+        // branch a fresh database takes.
         if self.get_meta("schema_version")?.is_some() {
             self.run_migrations()?;
         } else {
-            // Fresh database - set initial version
-            self.set_meta("schema_version", &CURRENT_SCHEMA_VERSION.to_string())?;
-            self.record_migration(CURRENT_SCHEMA_VERSION, "initial_schema")?;
+            // Fresh databases bootstrap at v1, then use the same migration path
+            // as existing databases for subsequent schema versions.
+            self.set_meta("schema_version", "1")?;
+            self.record_migration(1, "initial_schema")?;
+            self.run_migrations()?;
         }
 
         // The feature-flags schema is shipped alongside the rest of the
@@ -210,6 +297,9 @@ impl Database {
     }
 
     /// Remove a migration record from the database
+    // Not currently called from any code path in this crate. Kept rather than
+    // removed since deleting it is a product decision, not a lint-scoping one.
+    #[allow(dead_code)]
     fn remove_migration(&self, version: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM schema_migrations WHERE version = ?1",
@@ -232,10 +322,11 @@ impl Database {
 
     /// Run pending migrations to bring the database to the current schema version
     pub fn run_migrations(&self) -> Result<MigrationResult> {
+        // `schema_version` is the authority on how far the database has been
+        // migrated; `schema_migrations` is the audit log of what ran. A
+        // database whose version trails the log is still upgraded, and the log
+        // entry is rewritten rather than duplicated.
         let current_version = self.get_current_schema_version()?;
-        let applied = self.get_applied_migrations()?;
-        let applied_versions: std::collections::HashSet<i64> =
-            applied.iter().map(|m| m.version).collect();
 
         let mut migrations_applied = Vec::new();
 
@@ -243,10 +334,8 @@ impl Database {
         if current_version < CURRENT_SCHEMA_VERSION {
             // Apply migrations from current_version + 1 to CURRENT_SCHEMA_VERSION
             for version in (current_version + 1)..=CURRENT_SCHEMA_VERSION {
-                if !applied_versions.contains(&version) {
-                    self.apply_migration(version)?;
-                    migrations_applied.push(version);
-                }
+                self.apply_migration(version)?;
+                migrations_applied.push(version);
             }
         }
 
@@ -272,13 +361,14 @@ impl Database {
                 let checksum = self.compute_migration_checksum(version, migration.description())?;
                 let applied_at = chrono::Utc::now().to_rfc3339();
                 tx.execute(
-                    "INSERT INTO schema_migrations (version, name, applied_at, checksum) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR REPLACE INTO schema_migrations (version, name, applied_at, checksum) VALUES (?1, ?2, ?3, ?4)",
                     params![version, migration.description(), applied_at, checksum],
                 )?;
 
                 // Update schema version
                 tx.execute(
-                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     params![version.to_string()],
                 )?;
 
@@ -295,15 +385,29 @@ impl Database {
     /// Rollback a single migration within a transaction
     pub fn rollback_migration(&self, version: i64) -> Result<()> {
         let applied = self.get_applied_migrations()?;
-        if !applied.iter().any(|m| m.version == version) {
-            return Err(anyhow::anyhow!("Migration {} not applied", version));
-        }
+        let _current_version = self.get_current_schema_version()?;
 
-        let max_applied = applied.iter().map(|m| m.version).max().unwrap_or(0);
-        if version != max_applied {
+        // Migrations roll back newest first, so anything below the newest
+        // applied version is refused on that ground — whether or not it was
+        // itself applied. Only a version at or above the newest can be
+        // "not applied".
+        let max_applied = applied
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .ok_or_else(|| anyhow::anyhow!("No migrations applied"))?;
+
+        if version < max_applied {
             return Err(anyhow::anyhow!(
                 "Can only rollback the latest migration ({}), tried to rollback {}",
                 max_applied,
+                version
+            ));
+        }
+
+        if !applied.iter().any(|m| m.version == version) {
+            return Err(anyhow::anyhow!(
+                "Migration version {} is not applied",
                 version
             ));
         }
@@ -317,28 +421,25 @@ impl Database {
         // Rollback the migration
         match migration.down(&tx) {
             Ok(()) => {
-                // Remove the migration record if table exists
-                if let Err(e) = tx.execute(
+                // A migration's `down` undoes the schema it created, which for
+                // the initial migration includes the runner's own bookkeeping
+                // tables. Re-create them before recording the rollback.
+                tx.execute_batch(MIGRATION_BOOKKEEPING_SCHEMA)?;
+
+                // Remove the migration record
+                tx.execute(
                     "DELETE FROM schema_migrations WHERE version = ?1",
                     params![version],
-                ) {
-                    let msg = e.to_string();
-                    if !msg.contains("no such table") {
-                        return Err(e.into());
-                    }
-                }
+                )?;
 
-                // Update schema version to previous version if table exists
+                // Update schema version to previous version. This is an upsert
+                // because `meta` may have just been re-created empty.
                 let previous_version = if version > 1 { version - 1 } else { 0 };
-                if let Err(e) = tx.execute(
-                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     params![previous_version.to_string()],
-                ) {
-                    let msg = e.to_string();
-                    if !msg.contains("no such table") {
-                        return Err(e.into());
-                    }
-                }
+                )?;
 
                 tx.commit()?;
                 Ok(())
@@ -358,6 +459,7 @@ impl Database {
     fn get_migration(&self, version: i64) -> Option<Box<dyn Migration>> {
         match version {
             1 => Some(Box::new(MigrationV1 {})),
+            2 => Some(Box::new(MigrationV2 {})),
             _ => None,
         }
     }
@@ -400,8 +502,8 @@ impl Database {
     pub fn insert_wallet(&self, wallet: &WalletRow) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO wallets \
-             (name, public_key, secret_key, network, created_at, funded, rotation_history) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (name, public_key, secret_key, network, created_at, funded, rotation_history, usage_policy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 wallet.name,
                 wallet.public_key,
@@ -410,6 +512,7 @@ impl Database {
                 wallet.created_at,
                 wallet.funded,
                 wallet.rotation_history,
+                wallet.usage_policy,
             ],
         )?;
         Ok(())
@@ -417,7 +520,7 @@ impl Database {
 
     pub fn list_wallets(&self) -> Result<Vec<WalletRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, public_key, secret_key, network, created_at, funded, rotation_history FROM wallets ORDER BY created_at",
+            "SELECT name, public_key, secret_key, network, created_at, funded, rotation_history, usage_policy FROM wallets ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(WalletRow {
@@ -428,6 +531,7 @@ impl Database {
                 created_at: row.get(4)?,
                 funded: row.get(5)?,
                 rotation_history: row.get(6)?,
+                usage_policy: row.get(7)?,
             })
         })?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
@@ -435,7 +539,7 @@ impl Database {
 
     pub fn get_wallet(&self, name: &str) -> Result<Option<WalletRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, public_key, secret_key, network, created_at, funded, rotation_history FROM wallets WHERE name = ?1",
+            "SELECT name, public_key, secret_key, network, created_at, funded, rotation_history, usage_policy FROM wallets WHERE name = ?1",
         )?;
         let mut rows = stmt.query(params![name])?;
         if let Some(row) = rows.next()? {
@@ -447,6 +551,7 @@ impl Database {
                 created_at: row.get(4)?,
                 funded: row.get(5)?,
                 rotation_history: row.get(6)?,
+                usage_policy: row.get(7)?,
             }))
         } else {
             Ok(None)
@@ -462,14 +567,15 @@ impl Database {
     pub fn insert_network(&self, net: &NetworkRow) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO networks \
-             (name, horizon_url, soroban_rpc_url, friendbot_url, passphrase) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (name, horizon_url, soroban_rpc_url, friendbot_url, passphrase, ca_bundle) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 net.name,
                 net.horizon_url,
                 net.soroban_rpc_url,
                 net.friendbot_url,
                 net.passphrase,
+                net.ca_bundle,
             ],
         )?;
         Ok(())
@@ -477,7 +583,8 @@ impl Database {
 
     pub fn list_networks(&self) -> Result<Vec<NetworkRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, horizon_url, soroban_rpc_url, friendbot_url, passphrase FROM networks ORDER BY name",
+            "SELECT name, horizon_url, soroban_rpc_url, friendbot_url, passphrase, ca_bundle \
+             FROM networks ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(NetworkRow {
@@ -486,6 +593,7 @@ impl Database {
                 soroban_rpc_url: row.get(2)?,
                 friendbot_url: row.get(3)?,
                 passphrase: row.get(4)?,
+                ca_bundle: row.get(5)?,
             })
         })?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
@@ -530,6 +638,7 @@ impl Database {
     pub fn load_config(&self) -> Result<crate::utils::config::Config> {
         use crate::utils::config::{
             Config, NetworkConfig, PluginTrustConfig, WalletEntry, WalletRotationRecord,
+            WalletUsagePolicy,
         };
         use std::collections::HashMap;
 
@@ -544,9 +653,13 @@ impl Database {
             cfg.telemetry_enabled = telemetry.parse::<bool>().ok();
         }
         if let Some(plugin_trust) = self.get_config_kv("plugin_trust.trusted_sources")? {
-            cfg.plugin_trust = PluginTrustConfig {
-                trusted_sources: serde_json::from_str(&plugin_trust)?,
-            };
+            cfg.plugin_trust.trusted_sources = serde_json::from_str(&plugin_trust)?;
+        }
+        if let Some(trusted_pubs) = self.get_config_kv("plugin_trust.trusted_publishers")? {
+            cfg.plugin_trust.trusted_publishers = serde_json::from_str(&trusted_pubs)?;
+        }
+        if let Some(req_sigs) = self.get_config_kv("plugin_trust.require_signatures")? {
+            cfg.plugin_trust.require_signatures = req_sigs.parse::<bool>().unwrap_or(false);
         }
         if let Some(wallet_encryption) = self.get_config_kv("wallet_encryption")? {
             cfg.wallet_encryption = Some(serde_json::from_str(&wallet_encryption)?);
@@ -573,6 +686,7 @@ impl Database {
                         soroban_rpc_url: net.soroban_rpc_url,
                         friendbot_url: net.friendbot_url,
                         passphrase: net.passphrase,
+                        ca_bundle: net.ca_bundle,
                     },
                 )
             })
@@ -584,6 +698,17 @@ impl Database {
             .map(|wallet| {
                 let rotation_history: Vec<WalletRotationRecord> =
                     serde_json::from_str(&wallet.rotation_history).unwrap_or_default();
+                let kdf_options = wallet
+                    .secret_key
+                    .as_ref()
+                    .and_then(|s| crate::utils::crypto::extract_kdf_metadata(s).ok())
+                    .map(|m| crate::utils::crypto::KdfOptions {
+                        mem: Some(m.mem),
+                        iterations: Some(m.iterations),
+                        parallelism: Some(m.parallelism),
+                    });
+                let usage_policy = serde_json::from_str::<WalletUsagePolicy>(&wallet.usage_policy)
+                    .unwrap_or_default();
                 WalletEntry {
                     name: wallet.name,
                     public_key: wallet.public_key,
@@ -591,7 +716,12 @@ impl Database {
                     network: wallet.network,
                     created_at: wallet.created_at,
                     funded: wallet.funded,
+                    kdf_options,
                     rotation_history,
+                    derivation_index: None,
+                    derivation_path: None,
+                    mnemonic_wallet: None,
+                    usage_policy,
                 }
             })
             .collect();
@@ -616,6 +746,7 @@ impl Database {
                 created_at: wallet.created_at.clone(),
                 funded: wallet.funded,
                 rotation_history: serde_json::to_string(&wallet.rotation_history)?,
+                usage_policy: serde_json::to_string(&wallet.usage_policy)?,
             })?;
         }
 
@@ -626,6 +757,7 @@ impl Database {
                 soroban_rpc_url: net.soroban_rpc_url.clone(),
                 friendbot_url: net.friendbot_url.clone(),
                 passphrase: net.passphrase.clone(),
+                ca_bundle: net.ca_bundle.clone(),
             })?;
         }
 
@@ -637,6 +769,14 @@ impl Database {
         self.insert_config_kv(
             "plugin_trust.trusted_sources",
             &serde_json::to_string(&cfg.plugin_trust.trusted_sources)?,
+        )?;
+        self.insert_config_kv(
+            "plugin_trust.trusted_publishers",
+            &serde_json::to_string(&cfg.plugin_trust.trusted_publishers)?,
+        )?;
+        self.insert_config_kv(
+            "plugin_trust.require_signatures",
+            &cfg.plugin_trust.require_signatures.to_string(),
         )?;
         if let Some(kdf) = &cfg.wallet_encryption {
             self.insert_config_kv("wallet_encryption", &serde_json::to_string(kdf)?)?;
@@ -696,9 +836,28 @@ impl Database {
         }
     }
 
+    /// Copy this database's file to `dest`.
+    ///
+    /// Copies from the path this `Connection` actually has open — not the
+    /// default `db_path()`, which is wrong for any database opened via
+    /// [`Self::open_in_memory`] or a test/alternate path, and previously
+    /// caused every such backup to silently copy the unrelated default
+    /// database file instead of this one. `PRAGMA wal_checkpoint(TRUNCATE)`
+    /// folds the WAL file's contents back into the main database file first,
+    /// since `open()`/`open_in_memory()` both run in `journal_mode=WAL` and a
+    /// plain copy of only the main file could otherwise miss committed data
+    /// still sitting in `-wal`.
     pub fn backup(&self, dest: &std::path::Path) -> Result<()> {
-        let src = db_path();
-        std::fs::copy(&src, dest)?;
+        let src = self
+            .conn
+            .path()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("Cannot back up an in-memory database"))?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .context("Failed to checkpoint WAL before backup")?;
+        std::fs::copy(&src, dest)
+            .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
         Ok(())
     }
 
@@ -924,7 +1083,7 @@ impl Database {
             }
             ExportFormat::Csv => {
                 let mut wtr = csv::Writer::from_writer(writer);
-                wtr.write_record(&[
+                wtr.write_record([
                     "id",
                     "event_type",
                     "contract_id",
@@ -935,7 +1094,7 @@ impl Database {
                     "network",
                 ])?;
                 for event in events {
-                    wtr.write_record(&[
+                    wtr.write_record([
                         &event.id,
                         &event.event_type,
                         &event.contract_id,
@@ -985,6 +1144,25 @@ pub fn export_to_toml(db: &Database) -> Result<String> {
     Ok(toml::to_string_pretty(&db.load_config()?)?)
 }
 
+/// The tables the migration runner needs to record what it has done.
+///
+/// A migration's `down` undoes the schema it created, and for the initial
+/// migration that includes these tables. The runner re-creates them before
+/// writing the rollback down, so its own bookkeeping survives.
+const MIGRATION_BOOKKEEPING_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    checksum TEXT NOT NULL
+);
+";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -1005,7 +1183,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     network     TEXT NOT NULL DEFAULT 'testnet',
     created_at  TEXT NOT NULL,
     funded      INTEGER NOT NULL DEFAULT 0,
-    rotation_history TEXT NOT NULL DEFAULT '[]'
+    rotation_history TEXT NOT NULL DEFAULT '[]',
+    usage_policy TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS networks (
@@ -1013,7 +1192,8 @@ CREATE TABLE IF NOT EXISTS networks (
     horizon_url     TEXT NOT NULL,
     soroban_rpc_url TEXT,
     friendbot_url   TEXT,
-    passphrase      TEXT
+    passphrase      TEXT,
+    ca_bundle       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS config_kv (
@@ -1071,6 +1251,12 @@ pub struct WalletRow {
     pub created_at: String,
     pub funded: bool,
     pub rotation_history: String,
+    #[serde(default = "default_wallet_policy_json")]
+    pub usage_policy: String,
+}
+
+fn default_wallet_policy_json() -> String {
+    "{}".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1080,6 +1266,8 @@ pub struct NetworkRow {
     pub soroban_rpc_url: Option<String>,
     pub friendbot_url: Option<String>,
     pub passphrase: Option<String>,
+    /// PEM bundle of extra root CAs for this network (#902).
+    pub ca_bundle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1163,14 +1351,22 @@ impl Migration for MigrationV1 {
     fn description(&self) -> &str {
         "initial_schema"
     }
-    fn up(&self, conn: &Connection) -> Result<()> {
+
+    fn up(&self, _conn: &Connection) -> Result<()> {
         // This is a no-op since the initial schema is already applied in SCHEMA
         Ok(())
     }
+
     fn down(&self, conn: &Connection) -> Result<()> {
-        // Rollback: drop all tables
+        // Rollback: drop every table the initial bootstrap created. That
+        // includes the feature-flag tables, which `Database::initialize`
+        // applies alongside SCHEMA.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS events;
+            "DROP TABLE IF EXISTS flag_metrics;
+             DROP TABLE IF EXISTS flag_overrides;
+             DROP TABLE IF EXISTS flag_states;
+             DROP TABLE IF EXISTS flag_definitions;
+             DROP TABLE IF EXISTS events;
              DROP TABLE IF EXISTS templates;
              DROP TABLE IF EXISTS plugins;
              DROP TABLE IF EXISTS config_kv;
@@ -1183,6 +1379,39 @@ impl Migration for MigrationV1 {
              DROP TABLE IF EXISTS schema_migrations;
              DROP TABLE IF EXISTS meta;",
         )?;
+        Ok(())
+    }
+}
+
+struct MigrationV2;
+
+impl Migration for MigrationV2 {
+    fn version(&self) -> i64 {
+        2
+    }
+
+    fn description(&self) -> &str {
+        "wallet_usage_policy"
+    }
+
+    fn up(&self, conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(wallets)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        if !columns
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "usage_policy")
+        {
+            conn.execute(
+                "ALTER TABLE wallets ADD COLUMN usage_policy TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn down(&self, conn: &Connection) -> Result<()> {
+        conn.execute("ALTER TABLE wallets DROP COLUMN usage_policy", [])?;
         Ok(())
     }
 }
@@ -1208,11 +1437,15 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             funded: false,
             rotation_history: "[]".to_string(),
+            usage_policy: r#"{"allowed_networks":["mainnet"],"max_fee":250000,"allowed_contracts":[],"require_confirmation":true}"#.to_string(),
         })
         .unwrap();
         let wallets = db.list_wallets().unwrap();
         assert_eq!(wallets.len(), 1);
         assert_eq!(wallets[0].name, "alice");
+        assert!(wallets[0].usage_policy.contains("mainnet"));
+        assert!(wallets[0].usage_policy.contains("250000"));
+        assert!(wallets[0].usage_policy.contains("true"));
     }
 
     #[test]
@@ -1248,6 +1481,7 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             funded: true,
             rotation_history: "[]".to_string(),
+            usage_policy: "{}".to_string(),
         })
         .unwrap();
         let stats = db.stats().unwrap();
@@ -1265,6 +1499,7 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             funded: false,
             rotation_history: "[]".to_string(),
+            usage_policy: "{}".to_string(),
         })
         .unwrap();
         let removed = db.delete_wallet("temp").unwrap();
@@ -1373,7 +1608,6 @@ mod tests {
         // Try to rollback a migration that isn't the latest
         let result = db.rollback_migration(0);
         assert!(result.is_err());
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1413,9 +1647,13 @@ mod tests {
         let db = in_memory_db();
         let migration = MigrationV1 {};
         let conn = db.conn;
+
         // Verify tables exist before rollback
         let table_count: i64 = conn
             .query_row(
+                // `sqlite_%` names are SQLite's own internals (sqlite_sequence
+                // is created by the AUTOINCREMENT columns) and are not part of
+                // the schema a migration owns.
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
                 [],
                 |r| r.get(0),
@@ -1425,9 +1663,13 @@ mod tests {
 
         // Rollback
         migration.down(&conn).unwrap();
+
         // Verify tables are dropped
         let table_count_after: i64 = conn
             .query_row(
+                // `sqlite_%` names are SQLite's own internals (sqlite_sequence
+                // is created by the AUTOINCREMENT columns) and are not part of
+                // the schema a migration owns.
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
                 [],
                 |r| r.get(0),
@@ -1462,5 +1704,165 @@ mod tests {
         let result = db.run_migrations().unwrap();
         assert_eq!(result.current_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(result.migrations_applied, vec![1]);
+    }
+
+    /// A real N-1 -> N upgrade, on a file-backed database (not
+    /// `open_in_memory()`, which can't be closed and reopened the way a real
+    /// upgrade-on-next-launch happens): a database is created and
+    /// initialized at schema 0 (pre-migration), closed, then reopened and
+    /// initialized again, which is exactly what `run_migrations` (called
+    /// from `initialize`) is for.
+    #[test]
+    fn migration_upgrades_a_reopened_database_from_n_minus_1_to_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("upgrade-test.db");
+
+        {
+            let db = Database {
+                conn: Connection::open(&db_file).unwrap(),
+            };
+            db.initialize().unwrap();
+            // Roll the freshly-initialized database back to schema 0, as if
+            // it had been created by a build that predates migration 1 and
+            // is only now being opened by a build that has it.
+            db.conn
+                .execute(
+                    "UPDATE meta SET value = '0' WHERE key = 'schema_version'",
+                    [],
+                )
+                .unwrap();
+            db.conn
+                .execute("DELETE FROM schema_migrations WHERE version = 1", [])
+                .unwrap();
+            assert_eq!(db.get_current_schema_version().unwrap(), 0);
+        }
+
+        // Reopen as a fresh connection to the same file: this is the
+        // "upgrade on next launch" path, not the same in-process Database.
+        let reopened = Database {
+            conn: Connection::open(&db_file).unwrap(),
+        };
+        assert_eq!(reopened.get_current_schema_version().unwrap(), 0);
+        reopened.initialize().unwrap();
+        assert_eq!(
+            reopened.get_current_schema_version().unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+        let applied = reopened.get_applied_migrations().unwrap();
+        assert!(applied.iter().any(|m| m.version == CURRENT_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn open_succeeds_on_a_fresh_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("fresh.db");
+        assert!(!db_file.exists());
+
+        // Simulates `Database::open()`'s own logic without depending on
+        // `db_path()` (which reads the real config directory): a file that
+        // does not exist yet is never corrupted, so no integrity check runs.
+        let conn = Connection::open(&db_file).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .unwrap();
+        let db = Database { conn };
+        db.initialize().unwrap();
+        assert!(db.integrity_check().unwrap().iter().all(|r| r == "ok"));
+    }
+
+    #[test]
+    fn fail_clearly_if_corrupted_passes_on_an_intact_database() {
+        let db = in_memory_db();
+        let path = std::path::Path::new(":memory:");
+        assert!(db.fail_clearly_if_corrupted(path).is_ok());
+    }
+
+    #[test]
+    fn fail_clearly_if_corrupted_reports_a_typed_error_on_real_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("corrupt.db");
+        // Not a SQLite file at all: `PRAGMA integrity_check` reports this as
+        // corruption rather than erroring the pragma itself, which is what
+        // `fail_clearly_if_corrupted` is built to catch.
+        std::fs::write(&db_file, b"this is not a sqlite database file").unwrap();
+
+        let conn = Connection::open(&db_file).unwrap();
+        let db = Database { conn };
+        let result = db.fail_clearly_if_corrupted(&db_file);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.downcast_ref::<MigrationError>().is_some());
+        let message = err.to_string();
+        assert!(message.contains("corrupted"));
+        assert!(message.contains("starforge config db restore"));
+    }
+
+    #[test]
+    fn initialize_with_backup_skips_backup_for_a_fresh_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("fresh-with-backup.db");
+        let backup_dir = dir.path().join("backups");
+
+        let conn = Connection::open(&db_file).unwrap();
+        let db = Database { conn };
+        let backup_path = db.initialize_with_backup(&backup_dir).unwrap();
+
+        assert!(backup_path.is_none());
+        assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn initialize_with_backup_skips_backup_when_already_current() {
+        let db = in_memory_db();
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("backups");
+
+        // `db` is already fully initialized at CURRENT_SCHEMA_VERSION, so a
+        // second call has nothing to upgrade and should not back anything up.
+        let backup_path = db.initialize_with_backup(&backup_dir).unwrap();
+        assert!(backup_path.is_none());
+    }
+
+    #[test]
+    fn initialize_with_backup_backs_up_before_an_actual_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("needs-upgrade.db");
+        let backup_dir = dir.path().join("backups");
+
+        {
+            let db = Database {
+                conn: Connection::open(&db_file).unwrap(),
+            };
+            db.initialize().unwrap();
+            db.conn
+                .execute(
+                    "UPDATE meta SET value = '0' WHERE key = 'schema_version'",
+                    [],
+                )
+                .unwrap();
+            db.conn
+                .execute("DELETE FROM schema_migrations WHERE version = 1", [])
+                .unwrap();
+        }
+
+        let reopened = Database {
+            conn: Connection::open(&db_file).unwrap(),
+        };
+        let backup_path = reopened.initialize_with_backup(&backup_dir).unwrap();
+
+        let backup_path = backup_path.expect("an upgrade was pending, so a backup must be made");
+        assert!(backup_path.exists());
+        assert!(backup_path.starts_with(&backup_dir));
+        assert_eq!(
+            reopened.get_current_schema_version().unwrap(),
+            CURRENT_SCHEMA_VERSION
+        );
+
+        // The backup is a snapshot of the pre-upgrade file: opening it
+        // directly should show the pre-upgrade schema version, not the
+        // post-upgrade one the live connection now has.
+        let backup_conn = Connection::open(&backup_path).unwrap();
+        let backup_db = Database { conn: backup_conn };
+        assert_eq!(backup_db.get_current_schema_version().unwrap(), 0);
     }
 }
