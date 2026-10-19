@@ -10,6 +10,7 @@
 //! - **SDK / Network Compatibility** — version constraints and feature flag checks
 //! - **Test Reporting** — structured, machine-readable results with scoring
 
+use crate::utils::templates::SOROBAN_SDK_VERSION;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -113,7 +114,7 @@ pub struct TestConfig {
     pub run_performance: bool,
     pub run_compatibility: bool,
     pub run_docs: bool,
-    /// Soroban SDK version to test compatibility against (e.g. "21.0.0").
+    /// Soroban SDK version to test compatibility against (e.g. `SOROBAN_SDK_VERSION`).
     pub target_sdk_version: Option<String>,
     /// Minimum Rust edition expected in Cargo.toml.
     pub min_rust_edition: Option<String>,
@@ -127,7 +128,7 @@ impl Default for TestConfig {
             run_performance: true,
             run_compatibility: true,
             run_docs: true,
-            target_sdk_version: Some("21.0.0".to_string()),
+            target_sdk_version: Some(SOROBAN_SDK_VERSION.to_string()),
             min_rust_edition: Some("2021".to_string()),
         }
     }
@@ -533,13 +534,17 @@ fn validate_cargo_toml(cargo_path: &Path, findings: &mut Vec<TestFinding>) {
     }
 }
 
-fn find_soroban_dependency(package: &toml::Value) -> bool {
-    if let Some(deps) = package.get("dependencies") {
-        if deps.get("soroban-sdk").is_some() {
-            return true;
-        }
-    }
-    false
+/// Whether the manifest depends on `soroban-sdk`.
+///
+/// Takes the whole manifest, not the `[package]` table: dependencies live in
+/// their own top-level tables.
+fn find_soroban_dependency(manifest: &toml::Value) -> bool {
+    ["dependencies", "dev-dependencies"].iter().any(|table| {
+        manifest
+            .get(table)
+            .and_then(|deps| deps.get("soroban-sdk"))
+            .is_some()
+    })
 }
 
 fn validate_source_files(template_dir: &Path, findings: &mut Vec<TestFinding>) {
@@ -815,27 +820,30 @@ fn analyze_security_patterns(content: &str, file_name: &str, findings: &mut Vec<
 
         if is_pub || is_priv {
             // Process previous function
-            if in_pub_fn && fn_has_state_write && !fn_has_require_auth {
-                if current_fn != "initialize" && current_fn != "init" {
-                    findings.push(TestFinding {
-                        category: FindingCategory::Security,
-                        severity: Severity::High,
-                        title: format!(
-                            "Function '{}' writes state without require_auth()",
-                            current_fn
-                        ),
-                        description: format!(
-                            "Function '{}' modifies contract state but does not call require_auth(). \
-                             This may allow unauthorized state changes.",
-                            current_fn
-                        ),
-                        file: Some(file_name.to_string()),
-                        line: Some(fn_line),
-                        suggestion: Some(
-                            "Add caller.require_auth() or equivalent authorization check before state mutations.".to_string(),
-                        ),
-                    });
-                }
+            if in_pub_fn
+                && fn_has_state_write
+                && !fn_has_require_auth
+                && current_fn != "initialize"
+                && current_fn != "init"
+            {
+                findings.push(TestFinding {
+                    category: FindingCategory::Security,
+                    severity: Severity::High,
+                    title: format!(
+                        "Function '{}' writes state without require_auth()",
+                        current_fn
+                    ),
+                    description: format!(
+                        "Function '{}' modifies contract state but does not call require_auth(). \
+                         This may allow unauthorized state changes.",
+                        current_fn
+                    ),
+                    file: Some(file_name.to_string()),
+                    line: Some(fn_line),
+                    suggestion: Some(
+                        "Add caller.require_auth() or equivalent authorization check before state mutations.".to_string(),
+                    ),
+                });
             }
 
             if is_pub {
@@ -871,24 +879,27 @@ fn analyze_security_patterns(content: &str, file_name: &str, findings: &mut Vec<
     }
 
     // Check last function
-    if in_pub_fn && fn_has_state_write && !fn_has_require_auth {
-        if current_fn != "initialize" && current_fn != "init" {
-            findings.push(TestFinding {
-                category: FindingCategory::Security,
-                severity: Severity::High,
-                title: format!(
-                    "Function '{}' writes state without require_auth()",
-                    current_fn
-                ),
-                description: format!(
-                    "Function '{}' modifies contract state but does not call require_auth().",
-                    current_fn
-                ),
-                file: Some(file_name.to_string()),
-                line: Some(fn_line),
-                suggestion: Some("Add caller.require_auth() before state mutations.".to_string()),
-            });
-        }
+    if in_pub_fn
+        && fn_has_state_write
+        && !fn_has_require_auth
+        && current_fn != "initialize"
+        && current_fn != "init"
+    {
+        findings.push(TestFinding {
+            category: FindingCategory::Security,
+            severity: Severity::High,
+            title: format!(
+                "Function '{}' writes state without require_auth()",
+                current_fn
+            ),
+            description: format!(
+                "Function '{}' modifies contract state but does not call require_auth().",
+                current_fn
+            ),
+            file: Some(file_name.to_string()),
+            line: Some(fn_line),
+            suggestion: Some("Add caller.require_auth() before state mutations.".to_string()),
+        });
     }
 
     // Check for reentrancy patterns
@@ -1229,9 +1240,9 @@ fn run_compatibility_phase(template_dir: &Path, config: &TestConfig) -> Result<P
                         description: "soroban-sdk dependency format is not recognized.".to_string(),
                         file: Some("Cargo.toml".to_string()),
                         line: None,
-                        suggestion: Some(
-                            "Use soroban-sdk = \"21.0.0\" format for version pinning.".to_string(),
-                        ),
+                        suggestion: Some(format!(
+                            "Use soroban-sdk = \"{SOROBAN_SDK_VERSION}\" format for version pinning."
+                        )),
                     });
                 } else if let Some(target) = &config.target_sdk_version {
                     if version_str.contains(target) {
@@ -1498,10 +1509,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-soroban-sdk = "21.0.0"
+soroban-sdk = "22.0.0"
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 
 [profile.release]
 opt-level = "z"
@@ -1587,10 +1598,17 @@ mod test {
         let config = TestConfig::default();
         let report = test_template(&template_dir, &config).unwrap();
 
+        let blocking: Vec<String> = report
+            .phases
+            .iter()
+            .flat_map(|p| p.findings.iter())
+            .filter(|f| f.severity == Severity::Critical || f.severity == Severity::High)
+            .map(|f| format!("[{}] {}", f.severity.label(), f.title))
+            .collect();
         assert!(
             report.passed,
-            "Valid template should pass: {}",
-            report.summary
+            "Valid template should pass: {} — blocking findings: {:?}",
+            report.summary, blocking
         );
         assert!(
             report.quality_score >= 70,
@@ -1807,7 +1825,7 @@ impl UnwrapContract {
 
         fs::write(
             template_dir.join("Cargo.toml"),
-            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsoroban-sdk = \"21.0.0\"\n\n[lib]\ncrate-type = [\"rlib\"]\n",
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsoroban-sdk = \"22.0.0\"\n\n[lib]\ncrate-type = [\"rlib\"]\n",
         )
         .unwrap();
 
@@ -1832,7 +1850,7 @@ impl UnwrapContract {
 
         fs::write(
             template_dir.join("Cargo.toml"),
-            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsoroban-sdk = \"21.0.0\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[profile.release]\nopt-level = \"z\"\n",
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsoroban-sdk = \"22.0.0\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[profile.release]\nopt-level = \"z\"\n",
         )
         .unwrap();
 
@@ -1888,8 +1906,11 @@ impl UnwrapContract {
         };
 
         let json = serde_json::to_string_pretty(&phase).unwrap();
-        assert!(json.contains("security"));
-        assert!(json.contains("high"));
+        // The enums carry serde rename policies, so compare case-insensitively
+        // rather than pinning the JSON to a particular casing.
+        let lower = json.to_lowercase();
+        assert!(lower.contains("security"), "{}", json);
+        assert!(lower.contains("high"), "{}", json);
 
         let deserialized: PhaseResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.phase, "test");
