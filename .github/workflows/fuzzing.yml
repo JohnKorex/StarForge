@@ -19,9 +19,11 @@ on:
       - '.github/workflows/fuzzing.yml'
       - 'Cargo.toml'
   # Nightly, so the AddressSanitizer smoke stage still runs regularly without
-  # sitting on the critical path of every pull request.
+  # sitting on the critical path of every pull request. The weekly Monday
+  # entry is what actually drives mutation-testing (see that job's `if`).
   schedule:
     - cron: '0 3 * * *'
+    - cron: '30 2 * * 1'
 
   # Allow manual dispatch with configurable fuzz duration.
   workflow_dispatch:
@@ -34,8 +36,9 @@ on:
         description: 'Number of proptest cases per property'
         required: false
         default: '1000'
-  schedule:
-    - cron: '30 2 * * 1'
+
+permissions:
+  contents: read
 
 # Cancel in-progress runs when a new commit is pushed to the same branch.
 concurrency:
@@ -177,37 +180,28 @@ jobs:
 
       - name: Run each fuzz target
         run: |
-          DURATION=${{ github.event.inputs.fuzz_duration || '30' }}
-          TARGETS="
-            fuzz_validate_public_key
-            fuzz_validate_secret_key
-            fuzz_validate_contract_id
-            fuzz_validate_wallet_name
-            fuzz_validate_amount
-            fuzz_passphrase_strength
-            fuzz_wasm_hash
-            fuzz_encrypted_bundle_parse
-            fuzz_template_operations
-            fuzz_wasm_validation
-            fuzz_contract_invocation
-            fuzz_contract_spec_parse
-            fuzz_test_generator
-          "
-          failed=""
-          for target in $TARGETS; do
-            echo "::group::$target"
-            # The build above is already done, so this only fuzzes.
-            if cargo fuzz run "$target" --fuzz-dir fuzz \
-                 -- -max_total_time="$DURATION" -max_len=4096; then
-              echo "  PASS $target"
-            else
-              echo "  FAIL $target"
-              failed="$failed $target"
+          set -euo pipefail
+          DURATION="${{ github.event.inputs.fuzz_duration || '10' }}"
+          # Enumerate all [[bin]] targets from the fuzz Cargo.toml.
+          targets=$(cargo fuzz list --fuzz-dir fuzz)
+          if [ -z "$targets" ]; then
+            echo "::error::No fuzz targets found"
+            exit 1
+          fi
+          any_fail=0
+          while IFS= read -r target; do
+            [ -z "$target" ] && continue
+            echo "--- fuzzing: $target for ${DURATION}s ---"
+            if ! cargo fuzz run --fuzz-dir fuzz "$target" -- \
+                -max_total_time="$DURATION" \
+                -jobs=1 \
+                -workers=1 \
+                -artifact_prefix="fuzz/corpus/${target}/"; then
+              echo "::error::Fuzz target $target produced a finding or crashed"
+              any_fail=1
             fi
-            echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then
-            echo "Fuzz targets reported findings:$failed"
+          done <<< "$targets"
+          if [ "$any_fail" -ne 0 ]; then
             exit 1
           fi
           echo "All fuzz targets completed without findings."
@@ -220,67 +214,9 @@ jobs:
           path: fuzz/corpus/
 
   # ── 4. Coverage reporting ─────────────────────────────────────────────────────
-  coverage:
-    name: Coverage Report (cargo-llvm-cov)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable + llvm-tools
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev
-
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-cov-
-
-      - name: Generate LCOV coverage report
-        env:
-          PROPTEST_CASES: "1000"
-        run: |
-          cargo llvm-cov \
-            --locked --lcov --output-path target/lcov.info \
-            -- --test-threads=1
-
-      - name: Generate JSON coverage summary
-        env:
-          PROPTEST_CASES: "1000"
-        run: |
-          cargo llvm-cov \
-            --locked --json --output-path target/coverage.json \
-            -- --test-threads=1
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: target/lcov.info
-          flags: unittests,property-tests
-          name: starforge-coverage
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report-${{ github.run_id }}
-          path: |
-            target/lcov.info
-            target/coverage.json
+  # Moved to .github/workflows/coverage.yml, which runs on every Rust change
+  # (not only fuzz/proptest paths) and renders LCOV, JSON and HTML reports from
+  # a single instrumented test run.
 
   # ── 5. Mutation testing (scheduled / manual only) ─────────────────────────────
   mutation-testing:

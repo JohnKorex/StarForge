@@ -10,6 +10,8 @@ targets = [
 
 [advisories]
 version = 2
+# Reject yanked crates that may contain unpatched vulnerabilities.
+yanked = "warn"
 ignore = [
     # rustls-webpki 0.100/0.101 pulled in transitively via pinned ureq =2.7.1.
     "RUSTSEC-2026-0098",
@@ -39,6 +41,12 @@ ignore = [
     # timestamps, zip reads MS-DOS date fields, zxcvbn does date matching).
     # Revisit if the MSRV moves to 1.88 or these deps drop `time`.
     "RUSTSEC-2026-0009",
+    # wasmtime 27.0.0 advisories; pinned by Soroban ecosystem compatibility.
+    "RUSTSEC-2026-0094",
+    "RUSTSEC-2026-0095",
+    "RUSTSEC-2026-0096",
+    "RUSTSEC-2026-0222",
+    "RUSTSEC-2026-0269",
 ]
 
 [licenses]
@@ -76,3 +84,5 @@ skip = []
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
